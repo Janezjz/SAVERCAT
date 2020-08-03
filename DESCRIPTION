@@ -1,0 +1,32 @@
+Package: SAVERCAT
+Title: Dimension Reduction and Denoising of scRNA-seq Data
+Version: 1.0.0
+Authors@R: c(
+    person("Jane", "Zhang", email = "zjzhang1235@gmail.com",
+           role = c("aut", "cre")),
+    person("Mo", "Huang", email = "mohuangx@gmail.com", role = "aut"),
+    person("Nancy", "Zhang", email = "nzh@wharton.upenn.edu", role = "aut")
+    )
+Description: An implementation of a conditional variational autoencoder based method, SAVERCAT, which produces low-dimensional latent representation and denoised gene expression data for single cell RNA-seq data while adjusting for batch effect, library size and other observed confounding covariates.
+License: GPL-3
+Encoding: UTF-8
+LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.1.0
+Depends: R (>= 3.5.0)
+Imports: 
+    dplyr,
+    tensorflow (>= 2.0.0),
+    keras (>= 2.3.0),
+    irlba (>= 2.3.3),
+    uwot,
+    cowplot,
+    ggplot2,
+    Rtsne,
+    stats,
+    Matrix (>= 1.2-18),
+    Seurat (>= 3.0)
+Suggests: 
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
