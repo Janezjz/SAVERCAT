@@ -1,0 +1,391 @@
+---
+title: "Savercat Tutorial"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+SAVERCAT is a method for dimension reduction and denoising of single-cell gene expression data that can flexibly adjust for arbitrary observed sample- and cell-level covariates. With SAVERCAT, you can:
+
+* Obtain a low-dimensional representation of the cells that is corrected for the effects of batch and other confounding covariates.
+
+* Remove the effects of batch and other confounding covariates in the original high-dimensional gene expression matrix.
+
+* Further denoise the data, that is, remove technical variation that is due to the inherent random sampling introduced during the library preparation and sequencing steps of the experiment.
+
+This tutorial shows how to use SAVERCAT within a Seurat v3 workflow. For more details of this method and examples of its applications, see the paper (link ...).
+
+
+## Installation
+
+You can install SAVERCAT from github.
+
+```{r eval=FALSE}
+install.packages("devtools")
+devtools::install_github("Janezjz/SAVERCAT")
+```
+
+SAVERCAT depends on Python versions of Tensorflow 2.0 and Keras for neural network model training. To install these, you can either call functions from R as follows:
+
+```{r eval=FALSE}
+tensorflow::install_tensorflow()
+keras::install_keras()
+```
+
+Or you can install separately via Python.
+
+
+```{r message=FALSE, warning=FALSE}
+library(SAVERCAT)
+library(Seurat)
+library(cowplot)
+library(dplyr)
+```
+
+
+## Data
+
+For this tutorial, we use a Peripheral Blood Mononuclear Cells (PBMC) dataset that is released together with our package. The dataset consists of PBMCs from three healthy donors sequenced using three different 10x technologies – VDJ, V2, and V3. The original raw data for each sequencing run can be obtained from 10X Genomics:
+
+* 5' prime: https://support.10xgenomics.com/single-cell-vdj/datasets/3.0.0/vdj_v1_hs_pbmc2_5gex_protein
+
+* V3: https://support.10xgenomics.com/single-cell-gene-expression/datasets/3.0.0/pbmc_10k_v3
+
+* V2: https://support.10xgenomics.com/single-cell-gene-expression/datasets/2.1.0/pbmc8k
+
+In each dataset, we identified three main cell types – monocytes, T/NK cells, and B cells. Unidentified cells were removed after filtering out genes with non-zero expression in less than 2 cells. We randomly sampled 10,000 genes and 2,000 cells to include in the demo dataset `pbmc_prep`, which is included within SAVERCAT and used for this tutorial.  An analysis of the original data set can be found in our paper (give link).
+
+Load in the data.
+
+
+```{r}
+data("pbmc_prep")
+```
+
+The raw UMI count matrix is stored in `pbmc_prep$counts`. The rows correspond to genes and columns correspond to cells. There are 10000 genes and 2000 cells in pbmc_small.
+
+
+```{r}
+expr_mat = pbmc_prep$counts
+str(expr_mat)
+```
+
+`pbmc_prep$metadata` consists of two cell-level metadata: `tech` (technology) and `celltype`.  The cell type label will be used in our analyses only to assess the accuracy of covariate adjustment and denoising.  Following the analysis in our paper, we will treat each technology as a batch and our goal will be to align the gene expression values across batches without blurring the distinctions between the cell types.
+
+```{r}
+metadata = pbmc_prep$metadata
+head(metadata)
+```
+
+
+
+## Setup
+
+### Create a Seurat object
+
+First, we use the raw counts and metadata extracted from `pbmc_prep` to create a Seurat object.
+
+```{r}
+SeuratObject = CreateSeuratObject(counts = expr_mat, meta.data = metadata)
+SeuratObject
+```
+
+By performing the Seurat clustering workflow, we can see that cells separate according to both batch and cell type. So batches are confonded with celltypes.
+
+```{r fig.height = 4, fig.width = 12}
+all.genes = rownames(x = SeuratObject)
+SeuratObject = NormalizeData(SeuratObject, assay = "RNA", verbose = FALSE)
+SeuratObject = FindVariableFeatures(SeuratObject, assay = "RNA", selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+SeuratObject = ScaleData(SeuratObject, assay = "RNA", features = all.genes, verbose = FALSE)
+SeuratObject = RunPCA(SeuratObject, assay = "RNA", reduction.name = "pca_rna", verbose = FALSE)
+SeuratObject = RunTSNE(SeuratObject, assay = "RNA", reduction = "pca_rna", dims = 1:20, reduction.name = "tsne_rna")
+p11 = Seurat::DimPlot(SeuratObject, reduction = "tsne_rna", group.by = "tech")
+p21 = Seurat::DimPlot(SeuratObject, reduction = "tsne_rna", group.by = "celltype")
+plot_grid(p11,p21)
+```
+
+
+### Preprocessing
+
+The first step of the SAVERCAT workflow is to run the `SaverPreprocess` function. This function does several things:  
+
+1. It constructs a set of highly variable genes comprised of the highly variable genes found separately within each level of the covariate (in this example, batch).  
+
+2. It also constructs a design matrix for the covariates that we wish to corrected for. The covariates are assumed to be stored in `meta.data`. Names of categorical and continuous variables are passed to this function through the arguments `categorical.var` and `continuous.var`, respectively. By default, `categorical.var=NULL` and `continous.var=NULL`, in which case SAVERCAT corrects for only the scaled log cell library size.
+
+3. It prepares inputs and outputs for neural network model training.
+
+
+The main inputs of `SaverPreprocess` are:
+
+* `SeuratObject`: A Seurat object.
+
+* `assay.name`: Name of assay where count data is stored. Default is ‘RNA’.
+
+* `slot.name`: Name of slot where raw count data is stored. Default is 'counts'.
+
+* `categorical.var`: Names of categorical variables to be adjusted by SAVERCAT. Default is NULL.
+
+* `continous.var`: Names of continuous variables to be adjusted by SAVERCAT. Default is NULL.
+
+This function outputs a Seurat object with a list of information used to train SAVERCAT stored in `@tools$preprocess`.  For all intents and purposes, you don’t need to worry about what’s stored in there.  But here we will give you a glimpse:
+
+* `B`: Observed covariates matrix.
+
+* `hvg`: Names of highly variable genes.
+
+* `sf`: Cell specific size factors.
+
+* `x`: A submatrix of the expression count matrix. The rows correspond to cells and colomns correspond to highly variable genes or genes with a mean expression of more than `perc.exp`. This will be taken as the true outputs for the decoder to learn.
+
+* `x.norm`: Log normailized and standardized form of x. `x.norm` concatenated with `B` will be the input to the encoder.
+
+
+For `pbmc_prep` dataset, we set `categorical.var = c("tech")`, `continous.var = NULL`. Raw counts are stored in "RNA" assay, and thus we call `SaverPreprocess`  as follows. 
+
+
+```{r}
+SeuratObject = SaverPreprocess(SeuratObject, assay.name = "RNA", slot.name = "counts", categorical.var = c("tech"), continous.var = NULL)
+```
+
+For curiousity’s sake let’s look at what’s stored in `@tools$preprocess$B`. The first column is scaled log library size. The other three columns are scaled indicator variable for each batch.
+
+
+```{r}
+head(as.data.frame(SeuratObject@tools$preprocess$B))
+```
+
+Take a look at the highly variable genes, stored in `@tools$preprocess$hvg`:
+
+
+```{r}
+head(SeuratObject@tools$preprocess$hvg)
+```
+
+
+## Batch correction in low-dimensional representation
+
+First, we demonstrate how to use SAVERCAT to learn a low-dimensional representation of origianl gene expression matrix while correcting for effects of batch and other observed confounding variables. The function that does this job is `LearnLatentRepresentation`.
+
+The main inputs of this function are:
+
+* `SeuratObject`: A Seurat object.
+
+* `assay.name`: Name of assay where count data is stored. Default is 'RNA'.
+
+* `slot.name`: Name of slot where raw count data is stored. Default is 'counts'.
+
+* `save.model`: Folder specified to save the model.
+
+* `verbose`: Verbosity mode. 0 is silent, 1 is progress bar, 2 is one line per epoch. Default is 2.
+
+`LearnLatentRepresentation`  returns the original Seurat object with the reduced dimension embedding stored in `@reductions$saverc`, a `DimReduc` slot. The trained model will be stored in the specified folder. Here we go:
+
+```{r message=FALSE, warning=FALSE}
+SeuratObject = LearnLatentRepresentation(SeuratObject, assay.name = "RNA", slot.name = "counts", save.model = "data/cvae_model", verbose=0)
+```
+
+On a computer with Intel(R) Core(TM) i7-4770HQ processor @ 2.20GHz, 16GB of memory and 4 cores, this step takes about 4-5 minutes.
+
+```{r}
+SeuratObject@reductions$saverc
+```
+
+Take a look at the learned embedding:
+
+```{r}
+head(Embeddings(SeuratObject, reduction = "saverc")[, 1:5])
+```
+
+This low-dimensional representation can then be used for visualization and downstream analysis within any Seurat workflow. You just need to specify that this is the dimensional reduction slot to use, by setting `reduction = "saverc"`. Here we first plot UMAP and then cluster cells by a nearest neighbor graph computed on this embedding.
+
+#### Visualization using UMAP
+
+```{r message=FALSE, warning=FALSE}
+SeuratObject =  Seurat::RunUMAP(SeuratObject, reduction = "saverc", reduction.name = "umap_saverc", dims = 1:dim(SeuratObject@reductions$saverc)[2])
+```
+
+
+```{r  fig.height = 4, fig.width = 12}
+p1 = Seurat::DimPlot(SeuratObject, reduction = "umap_saverc", group.by = "tech")
+p2 = Seurat::DimPlot(SeuratObject, reduction = "umap_saverc", group.by = "celltype")
+plot_grid(p1,p2)
+```
+
+#### Cluster cells by nearest neighbor graph on the SAVERCAT low-dimensional reduction:
+
+
+```{r}
+SeuratObject = Seurat::FindNeighbors(SeuratObject, dims = 1:10, reduction = "saverc")
+SeuratObject = Seurat::FindClusters(SeuratObject, resolution = 0.5)
+head(Idents(SeuratObject))
+```
+
+## Decoding the latent low-dimensional representation
+
+Next, to correct for covariates and denoise the original gene expression matrix, we need to train a decoder that maps the latent representation back to the original gene expression space.  This is a time-consuming step, partly because we employ cross-validation to guard against over-fitting (a.k.a. over-smoothing of the data, which may introduce artifacts into the data.)  The function for this step is `DecodeLatentRepresentation`, which does not yet return a corrected gene expression matrix, but instead saves a memory-efficient “decoder” model.   This model can then be used for fast and flexible adjustment of all (or a subset) of the covariates and for denoising.  
+
+The main inputs of `DecodeLatentRepresentation` are:
+
+* `SeuratObject`: A Seurat object with SAVERCAT low-dimensional representation stored in `@reductions$saverc`.
+
+* `assay.name`: Name of assay where count data is stored. Default is 'RNA'.
+
+* `slot.name`: Name of slot where raw count data is stored. Default is 'counts'.
+
+* `save.model`: Folder specified to save the model.
+
+* `verbose`: Verbosity mode. 0 is silent, 1 is progress bar, 2 is one line per epoch. Default is 2.
+
+It returns a Seurat object with training details stored in `SeuratObject@tools$train`. The trained decoder model is stored in the folder specified in `save.model`.
+
+
+```{r message=FALSE, warning=FALSE}
+SeuratObject = DecodeLatentRepresentation(SeuratObject, assay.name = "RNA", slot.name = "counts", save.model = "data/cvae_model", verbose=0)
+```
+
+On a computer with Intel(R) Core(TM) i7-4770HQ processor @ 2.20GHz, 16GB of memory and 4 cores, this step takes about 5-7 minutes.
+
+## Gene expression recovery
+
+
+Now we can use the low-dimensional latent representation produced by `LearnLatentRepresentation` function and decoder model trained by `DecodeLatentRepresentation` function to perform covariate correction and denoising of the gene expression matrix. The function for doing this is `SaverDenoise`. 
+
+Inputs to `SaverDenoise` function:
+
+* `SeuratObject`: A Seurat object with SAVERCAT low-dimensional representation stored in `@reductions$saverc`.
+
+* `assay.name`: Name of assay where count data is stored. Default is 'RNA'.
+
+* `slot.name`: Name of slot where raw count data is stored. Default is 'counts'.
+
+* `save.model`: Folder where well trained decoder model is stored.
+
+* `subset.genes`: Names of a subset of genes for which the covariate-correction and denoising will be performed. Default is NULL, in which case the procedure will be applied to all genes.
+
+
+
+`SaverDenoise` returns a Seurat object with three new assays:
+
+* `saverdenoised`: the denoised estimates based on the posterior mean, which is a weighted average of the corrected counts (`savercovadj`) and the autoencoder covariate-corrected prediction.  These are the values that you should use for visualization (e.g. heatmaps), clustering, and trajectory inference.
+
+* `saversamp`: For each gene in each cell, a sample from its Bayesian posterior distribution under the SAVER model. Thus, the values in this matrix reflect the uncertainty of the SAVER denoised estimates. These are the values to use if you are computing gene dispersion values, gene-gene correlations, or, in general, quantifying the uncertainty or variance of genes across cells.    
+
+* `savercovadj`: covariate-corrected counts using cdf matching centered on the autoencoder predictions. If you don’t want to do any denoising or smoothing of the data, and just want to correct for the covariates, these are the values to use. Also, differential expression analyses using `savercovadj` values will allow for correct type I error control.
+
+In each of the above newly created assays, the denoised/covariate adjusted/sampled counts are stored in the `counts` slot.  
+
+To demonstrate, for the `pbmc_prep` dataset, we will predict for all genes. Since denoised (and covariate adjusted) data are no longer sparse, and thus may be memory consuming if you do it for all genes at once, you may be interested in only running this step on a subset of genes. You can specify the subset of genes for which you want denoised- and covariate-corrected values by passing their index to the parameter `subset.genes`. For example, you can set `subset.genes = c("IL1B", "CD36", "CD6", "CD7", "HLA-DRA")` then you’ll only perform covariate-correction and denoising for these 5 genes.
+
+This step took 30-50 seconds to run on a computer with 16GB memory and 4 cores.
+
+```{r}
+SeuratObject = SaverDenoise(SeuratObject, assay.name = "RNA", slot.name = "counts", save.model = "data/cvae_model/decoder", subset.genes = NULL)
+```
+
+```{r}
+SeuratObject
+```
+
+Take a look at the denoised/sampled/covariate adjusted counts.
+
+```{r}
+# denoised SAVER estimates
+GetAssayData(object = SeuratObject, assay = "saverdenoised", slot = "counts")[1:6,1:6]
+```
+
+```{r}
+# sampled SAVER estimates.  
+GetAssayData(object = SeuratObject, assay = "saversamp", slot = "counts")[1:6,1:6]
+```
+
+```{r}
+# SAVER covariate corrected counts
+GetAssayData(object = SeuratObject, assay = "savercovadj", slot = "counts")[1:6,1:6]
+```
+
+
+Next we show how to use these denoised/covariate adjusted/sampled counts in differential expression testing and visualization.
+
+### Identify marker genes (samp/covadj)
+
+To identify marker genes in each cell type, you can use either the `saversamp` or the `savercovadj` assay. Here we perform differential expression using `saversamp`.
+
+```{r}
+DefaultAssay(SeuratObject) = "saversamp"
+all.genes = rownames(x = SeuratObject)
+SeuratObject = NormalizeData(SeuratObject, verbose = FALSE)
+SeuratObject = FindVariableFeatures(SeuratObject, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+SeuratObject = ScaleData(SeuratObject, features = all.genes, verbose = FALSE)
+Idents(object = SeuratObject) = 'celltype'
+markers = FindAllMarkers(SeuratObject, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+Take a look at the top 2 marker genes for each cell type.
+
+```{r}
+top2 = markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+top2
+```
+
+
+### Visualize marker gene distribution (samp)
+
+As mentioned above, the SAVER sampled values align the distributions by batch while maintaining variation across cell types. To compare of gene expression distributions across cell types, we recommend you to use `saversamp` assay.
+
+```{r fig.height = 12, fig.width = 12}
+VlnPlot(SeuratObject, features = top2$gene, assay = "saversamp", log = TRUE, pt.size = 0.8)
+```
+
+Here we also draw violin plots using the SAVER denoised estimates for comparison purpose. As you can see, there is less variation between cells within each cell type using the SAVER denoised estimates.
+
+```{r fig.height = 12, fig.width = 12}
+SeuratObject = NormalizeData(SeuratObject, assay="saverdenoised", verbose = FALSE)
+SeuratObject = FindVariableFeatures(SeuratObject, assay="saverdenoised", selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+SeuratObject = ScaleData(SeuratObject, assay="saverdenoised", features = all.genes, verbose = FALSE)
+VlnPlot(SeuratObject, features = top2$gene, assay = "saverdenoised", log = TRUE, pt.size = 0.8)
+```
+
+
+### Heatmap of gene expression (denoised)
+
+To visualize gene expression and perform trajectory analyses, you should use SAVER estimate in `saverdenoised` assay. This is the posterior mean of the gene expression level. Intuitively, this estimate emulates the data that you would have gotten, if there were no batch effects and if deeper sequencing were performed on your sample. 
+
+We draw a heatmap of the denoised gene expression for top 20 marker genes.
+
+```{r fig.height = 8, fig.width = 12}
+DefaultAssay(SeuratObject) = "saverdenoised"
+top20 = markers %>% group_by(cluster) %>% top_n(n = 20, wt = avg_logFC)
+DoHeatmap(SeuratObject, features = unique(top20$gene), assay = "saverdenoised", angle = 0)
+```
+
+For comparison, we also plot the heatmap of the raw gene expression for the top 20 marker genes. Compared to the former plot, there is more noise in the following plot.
+
+```{r fig.height = 8, fig.width = 12}
+DoHeatmap(SeuratObject, features = unique(top20$gene), assay = "RNA", angle = 0)
+```
+
+
+### Visualize genes on the dim-reduction plot (denoised)
+
+Denoised estimates should be used for visualizing genes on the dim-reduction plot.
+
+For `pbmc_prep` dataset, we first perform UMAP on the latent dimension reduction (`saverc`) and store the embedding in `umap_saverc`. Then we color cells by the marker genes from the denoised matrix with `FeaturePlot` function.
+
+
+```{r message=FALSE, warning=FALSE, fig.height = 12, fig.width = 15}
+SeuratObject =  Seurat::RunUMAP(SeuratObject, reduction = "saverc", reduction.name = "umap_saverc", dims = 1:dim(SeuratObject@reductions$saverc)[2])
+DefaultAssay(SeuratObject) = "saverdenoised"
+FeaturePlot(SeuratObject, features = top2$gene, reduction = "umap_saverc")
+```
+
+
