@@ -28,4 +28,4 @@ keras::install_keras()
 Or you can install separately via Python.
 
 ## Tutorial
-Please refer to this [vignette](https://https://github.com/Janezjz/SAVERCAT/vignettes/savercat_tutorial.Rmd) for a quick start tutorial.
+Please refer to this [vignette](https://https://github.com/Janezjz/SAVERCAT/master/vignettes/savercat_tutorial.Rmd) for a quick start tutorial.
