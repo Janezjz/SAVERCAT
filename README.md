@@ -29,3 +29,6 @@ Or you can install separately via Python.
 
 ## Tutorial
 Please refer to this [vignette](http://htmlpreview.github.io/?https://github.com/Janezjz/SAVERCAT/master/docs/savercat_tutorial.html) for a quick start tutorial.
+
+## Reference
+For more details of this method and examples of its applications, see the [paper](https://www.biorxiv.org/content/10.1101/2020.08.03.234765v1).
